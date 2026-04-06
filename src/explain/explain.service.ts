@@ -43,6 +43,12 @@ interface ChatCompletionResponse {
   }>;
 }
 
+interface SourceContext {
+  sourceType: 'url' | 'pdf';
+  sourceUrl: string;
+  snippets: string[];
+}
+
 @Injectable()
 export class ExplainService {
   private apiUrl: string;
@@ -60,6 +66,12 @@ export class ExplainService {
 
   async create(dto: CreateExplanationDto, userId: string) {
     const levelInstruction = LEVEL_INSTRUCTIONS[dto.level];
+    const sourceContext = dto.sourceUrl ? await this.fetchSourceContext(dto.sourceUrl) : null;
+    const sourcePrompt = sourceContext
+      ? `\n\nUse only the source snippets below for factual claims and cite them as [1], [2], etc.\nSource URL: ${sourceContext.sourceUrl}\nSnippets:\n${sourceContext.snippets
+          .map((snippet, idx) => `[${idx + 1}] ${snippet}`)
+          .join('\n')}`
+      : '';
 
     const response = await fetch(this.apiUrl, {
       method: 'POST',
@@ -73,7 +85,7 @@ export class ExplainService {
           { role: 'system', content: SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `Level: ${dto.level}\nInstruction: ${levelInstruction}\nTopic: ${dto.topic}`,
+            content: `Level: ${dto.level}\nInstruction: ${levelInstruction}\nTopic: ${dto.topic}${sourcePrompt}`,
           },
         ],
       }),
@@ -93,6 +105,16 @@ export class ExplainService {
         level: dto.level,
         answer,
         userId,
+        sources: sourceContext
+          ? {
+              create: sourceContext.snippets.map((snippet, idx) => ({
+                citationIndex: idx + 1,
+                sourceUrl: sourceContext.sourceUrl,
+                sourceType: sourceContext.sourceType,
+                snippet,
+              })),
+            }
+          : undefined,
       },
       select: {
         id: true,
@@ -100,6 +122,16 @@ export class ExplainService {
         level: true,
         answer: true,
         shareId: true,
+        sources: {
+          orderBy: { citationIndex: 'asc' },
+          select: {
+            id: true,
+            citationIndex: true,
+            sourceUrl: true,
+            sourceType: true,
+            snippet: true,
+          },
+        },
         createdAt: true,
       },
     });
@@ -115,6 +147,16 @@ export class ExplainService {
         level: true,
         answer: true,
         shareId: true,
+        sources: {
+          orderBy: { citationIndex: 'asc' },
+          select: {
+            id: true,
+            citationIndex: true,
+            sourceUrl: true,
+            sourceType: true,
+            snippet: true,
+          },
+        },
         createdAt: true,
       },
     });
@@ -155,6 +197,16 @@ export class ExplainService {
         topic: true,
         level: true,
         answer: true,
+        sources: {
+          orderBy: { citationIndex: 'asc' },
+          select: {
+            id: true,
+            citationIndex: true,
+            sourceUrl: true,
+            sourceType: true,
+            snippet: true,
+          },
+        },
         createdAt: true,
         comments: {
           orderBy: { createdAt: 'asc' },
@@ -243,5 +295,81 @@ export class ExplainService {
     }
 
     throw new BadGatewayException('Failed to generate a unique share link');
+  }
+
+  private async fetchSourceContext(rawUrl: string): Promise<SourceContext> {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new BadGatewayException('Only http/https source URLs are supported');
+    }
+
+    const response = await fetch(parsed.toString(), {
+      headers: { 'User-Agent': 'ExplainLikeIm5Bot/1.0' },
+    });
+
+    if (!response.ok) {
+      throw new BadGatewayException(`Failed to fetch source URL (${response.status})`);
+    }
+
+    const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+    const isPdf =
+      contentType.includes('application/pdf') || parsed.pathname.toLowerCase().endsWith('.pdf');
+
+    const text = isPdf
+      ? await this.extractPdfText(response)
+      : this.extractTextFromHtml(await response.text());
+    const snippets = this.buildSnippets(text);
+
+    if (!snippets.length) {
+      throw new BadGatewayException('Source URL does not contain enough readable text');
+    }
+
+    return {
+      sourceType: isPdf ? 'pdf' : 'url',
+      sourceUrl: parsed.toString(),
+      snippets,
+    };
+  }
+
+  private async extractPdfText(response: Response) {
+    const pdfParse = (await import('pdf-parse')).default;
+    const data = await response.arrayBuffer();
+    const parsed = await pdfParse(Buffer.from(data));
+    return parsed.text ?? '';
+  }
+
+  private extractTextFromHtml(html: string) {
+    return html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private buildSnippets(text: string) {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    const maxSnippets = 5;
+    const snippetLength = 360;
+    if (!clean) return [];
+
+    const snippets: string[] = [];
+    let cursor = 0;
+
+    while (cursor < clean.length && snippets.length < maxSnippets) {
+      const end = Math.min(cursor + snippetLength, clean.length);
+      const slice = clean.slice(cursor, end);
+      const normalized = slice.trim();
+      if (normalized.length > 40) {
+        snippets.push(normalized);
+      }
+      cursor = end;
+    }
+
+    return snippets;
   }
 }

@@ -23,7 +23,19 @@ model Explanation {
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   comments  PublicComment[]
+  sources   ExplanationSource[]
   createdAt DateTime @default(now())
+}
+
+model ExplanationSource {
+  id            String      @id @default(uuid())
+  citationIndex Int
+  sourceUrl     String
+  sourceType    String
+  snippet       String
+  explanationId String
+  explanation   Explanation @relation(fields: [explanationId], references: [id], onDelete: Cascade)
+  createdAt     DateTime    @default(now())
 }
 
 model PublicComment {
