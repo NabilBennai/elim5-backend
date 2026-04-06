@@ -1,18 +1,40 @@
-import { Injectable } from '@nestjs/common';
+import { BadGatewayException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateExplanationDto } from './explain.dto';
 
-const SYSTEM_PROMPT = `You are an expert at explaining complex topics in simple terms.
-When a user gives you a topic or concept, explain it as if they were 5 years old.
-Use simple analogies, everyday examples, and short sentences.
-Keep your explanation friendly, fun, and easy to understand.
-Do not use jargon or technical terms without immediately explaining them.
-Keep responses concise — aim for 3-5 short paragraphs at most.
-IMPORTANT: Always respond in the same language the user wrote their question in.`;
+const SYSTEM_PROMPT = `You are an expert teacher.
+Explain topics clearly for the requested audience level.
+Always respond in the same language the user used.
+Avoid unnecessary jargon. If technical terms are required, define them immediately.
+Keep explanations concise and structured.
+
+Output format rules (strict):
+- Return valid Markdown for prose structure.
+- Use headings, bullet lists, and tables only when useful.
+- Use LaTeX only for math with inline $...$ and display $$...$$.
+- Never emit malformed math like standalone [ ... ].
+- Never double-escape backslashes in LaTeX commands.
+- Avoid duplicated artifacts like ee, xx, or 100x2=200100x2=200.`;
+
+const LEVEL_INSTRUCTIONS: Record<CreateExplanationDto['level'], string> = {
+  ELI5: 'Use very simple language, playful analogies, and short sentences suitable for a young child.',
+  BEGINNER:
+    'Use simple language for a newcomer. Introduce key terms gently with practical examples.',
+  INTERMEDIATE:
+    'Assume basic familiarity. Provide a more detailed explanation with cause/effect and common pitfalls.',
+  EXPERT:
+    'Assume strong background. Be precise, nuanced, and compact. Include tradeoffs and technical depth.',
+};
 
 interface ChatCompletionResponse {
-  choices: { message: { role: string; content: string } }[];
+  choices?: Array<{
+    message?: {
+      role?: string;
+      content?: string | Array<{ type?: string; text?: string }>;
+    };
+    text?: string;
+  }>;
 }
 
 @Injectable()
@@ -31,6 +53,8 @@ export class ExplainService {
   }
 
   async create(dto: CreateExplanationDto, userId: string) {
+    const levelInstruction = LEVEL_INSTRUCTIONS[dto.level];
+
     const response = await fetch(this.apiUrl, {
       method: 'POST',
       headers: {
@@ -41,7 +65,10 @@ export class ExplainService {
         model: this.model,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: `Explain this like I'm 5: ${dto.topic}` },
+          {
+            role: 'user',
+            content: `Level: ${dto.level}\nInstruction: ${levelInstruction}\nTopic: ${dto.topic}`,
+          },
         ],
       }),
     });
@@ -52,17 +79,19 @@ export class ExplainService {
     }
 
     const data = (await response.json()) as ChatCompletionResponse;
-    const answer = data.choices[0].message.content;
+    const answer = this.extractAnswer(data);
 
     return this.prisma.explanation.create({
       data: {
         topic: dto.topic,
+        level: dto.level,
         answer,
         userId,
       },
       select: {
         id: true,
         topic: true,
+        level: true,
         answer: true,
         createdAt: true,
       },
@@ -76,9 +105,36 @@ export class ExplainService {
       select: {
         id: true,
         topic: true,
+        level: true,
         answer: true,
         createdAt: true,
       },
     });
+  }
+
+  private extractAnswer(data: ChatCompletionResponse): string {
+    const choice = data.choices?.[0];
+    const messageContent = choice?.message?.content;
+
+    if (typeof messageContent === 'string' && messageContent.trim()) {
+      return messageContent;
+    }
+
+    if (Array.isArray(messageContent)) {
+      const joined = messageContent
+        .map((chunk) => chunk.text ?? '')
+        .join('')
+        .trim();
+
+      if (joined) {
+        return joined;
+      }
+    }
+
+    if (typeof choice?.text === 'string' && choice.text.trim()) {
+      return choice.text;
+    }
+
+    throw new BadGatewayException('LLM API returned an empty answer payload');
   }
 }

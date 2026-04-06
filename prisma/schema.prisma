@@ -17,6 +17,7 @@ model User {
 model Explanation {
   id        String   @id @default(uuid())
   topic     String
+  level     String   @default("ELI5")
   answer    String
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)

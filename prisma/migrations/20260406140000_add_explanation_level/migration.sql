@@ -1,0 +1,2 @@
+ALTER TABLE "Explanation"
+ADD COLUMN "level" TEXT NOT NULL DEFAULT 'ELI5';
