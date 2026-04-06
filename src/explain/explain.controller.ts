@@ -20,6 +20,12 @@ export class ExplainController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Get('credits')
+  credits(@Request() req: { user: { id: string } }): Promise<unknown> {
+    return this.explain.getCredits(req.user.id);
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Post(':id/share')
   share(@Param('id') id: string, @Request() req: { user: { id: string } }) {
     return this.explain.createShare(id, req.user.id);

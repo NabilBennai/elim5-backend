@@ -1,6 +1,8 @@
 import {
   BadGatewayException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -49,11 +51,29 @@ interface SourceContext {
   snippets: string[];
 }
 
+interface CreditWindowStatus {
+  key: 'fiveHours' | 'daily' | 'weekly';
+  label: string;
+  windowHours: number;
+  limit: number;
+  used: number;
+  remaining: number;
+  resetAt: string;
+}
+
+interface CreditStatusResponse {
+  allowed: boolean;
+  windows: CreditWindowStatus[];
+}
+
 @Injectable()
 export class ExplainService {
   private apiUrl: string;
   private apiKey: string;
   private model: string;
+  private credits5hLimit: number;
+  private creditsDailyLimit: number;
+  private creditsWeeklyLimit: number;
 
   constructor(
     private prisma: PrismaService,
@@ -62,9 +82,14 @@ export class ExplainService {
     this.apiUrl = 'https://api.llmapi.ai/v1/chat/completions';
     this.apiKey = config.getOrThrow<string>('LLMAPI_KEY');
     this.model = config.get<string>('LLMAPI_MODEL', 'qwen-flash');
+    this.credits5hLimit = this.readPositiveInt(config, 'AI_CREDITS_5H', 10);
+    this.creditsDailyLimit = this.readPositiveInt(config, 'AI_CREDITS_DAILY', 25);
+    this.creditsWeeklyLimit = this.readPositiveInt(config, 'AI_CREDITS_WEEKLY', 120);
   }
 
   async create(dto: CreateExplanationDto, userId: string) {
+    await this.enforceCredits(userId);
+
     const levelInstruction = LEVEL_INSTRUCTIONS[dto.level];
     const sourceContext = dto.sourceUrl ? await this.fetchSourceContext(dto.sourceUrl) : null;
     const sourcePrompt = sourceContext
@@ -160,6 +185,40 @@ export class ExplainService {
         createdAt: true,
       },
     });
+  }
+
+  async getCredits(userId: string): Promise<CreditStatusResponse> {
+    const now = new Date();
+    const windows = this.getWindows(now);
+
+    const usage = await Promise.all(
+      windows.map((window) =>
+        this.prisma.explanation.count({
+          where: {
+            userId,
+            createdAt: { gte: window.since },
+          },
+        }),
+      ),
+    );
+
+    const statuses: CreditWindowStatus[] = windows.map((window, index) => {
+      const used = usage[index];
+      const remaining = Math.max(window.limit - used, 0);
+
+      return {
+        key: window.key,
+        label: window.label,
+        windowHours: window.hours,
+        limit: window.limit,
+        used,
+        remaining,
+        resetAt: new Date(now.getTime() + window.hours * 60 * 60 * 1000).toISOString(),
+      };
+    });
+
+    const allowed = statuses.every((status) => status.remaining > 0);
+    return { allowed, windows: statuses };
   }
 
   async createShare(explanationId: string, userId: string) {
@@ -279,6 +338,61 @@ export class ExplainService {
     }
 
     throw new BadGatewayException('LLM API returned an empty answer payload');
+  }
+
+  private async enforceCredits(userId: string) {
+    const creditStatus = await this.getCredits(userId);
+    if (creditStatus.allowed) return;
+
+    throw new HttpException(
+      {
+        message:
+          'AI credit limit reached. Your credits recharge on rolling windows: 5 hours, daily, and weekly.',
+        code: 'AI_CREDITS_EXHAUSTED',
+        creditStatus,
+      },
+      HttpStatus.TOO_MANY_REQUESTS,
+    );
+  }
+
+  private getWindows(now: Date) {
+    return [
+      {
+        key: 'fiveHours' as const,
+        label: '5h',
+        hours: 5,
+        limit: this.credits5hLimit,
+        since: new Date(now.getTime() - 5 * 60 * 60 * 1000),
+      },
+      {
+        key: 'daily' as const,
+        label: '24h',
+        hours: 24,
+        limit: this.creditsDailyLimit,
+        since: new Date(now.getTime() - 24 * 60 * 60 * 1000),
+      },
+      {
+        key: 'weekly' as const,
+        label: '7d',
+        hours: 7 * 24,
+        limit: this.creditsWeeklyLimit,
+        since: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000),
+      },
+    ];
+  }
+
+  private readPositiveInt(config: ConfigService, key: string, defaultValue: number) {
+    const raw = config.get<string | number | undefined>(key);
+    if (raw === undefined || raw === null || raw === '') {
+      return defaultValue;
+    }
+
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return defaultValue;
+    }
+
+    return Math.floor(parsed);
   }
 
   private async generateUniqueShareId() {
