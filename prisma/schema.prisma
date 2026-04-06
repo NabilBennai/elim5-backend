@@ -19,7 +19,18 @@ model Explanation {
   topic     String
   level     String   @default("ELI5")
   answer    String
+  shareId   String?  @unique
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comments  PublicComment[]
   createdAt DateTime @default(now())
+}
+
+model PublicComment {
+  id            String      @id @default(uuid())
+  authorName    String
+  content       String
+  explanationId String
+  explanation   Explanation @relation(fields: [explanationId], references: [id], onDelete: Cascade)
+  createdAt     DateTime    @default(now())
 }

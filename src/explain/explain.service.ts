@@ -1,7 +1,13 @@
-import { BadGatewayException, Injectable } from '@nestjs/common';
+import {
+  BadGatewayException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { CreateExplanationDto } from './explain.dto';
+import { CreateExplanationDto, CreatePublicCommentDto } from './explain.dto';
 
 const SYSTEM_PROMPT = `You are an expert teacher.
 Explain topics clearly for the requested audience level.
@@ -93,6 +99,7 @@ export class ExplainService {
         topic: true,
         level: true,
         answer: true,
+        shareId: true,
         createdAt: true,
       },
     });
@@ -107,6 +114,90 @@ export class ExplainService {
         topic: true,
         level: true,
         answer: true,
+        shareId: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  async createShare(explanationId: string, userId: string) {
+    const explanation = await this.prisma.explanation.findUnique({
+      where: { id: explanationId },
+      select: { id: true, userId: true, shareId: true },
+    });
+
+    if (!explanation) {
+      throw new NotFoundException('Explanation not found');
+    }
+
+    if (explanation.userId !== userId) {
+      throw new ForbiddenException('You can only share your own explanations');
+    }
+
+    if (explanation.shareId) {
+      return { shareId: explanation.shareId };
+    }
+
+    const shareId = await this.generateUniqueShareId();
+    await this.prisma.explanation.update({
+      where: { id: explanationId },
+      data: { shareId },
+    });
+
+    return { shareId };
+  }
+
+  async getSharedExplanation(shareId: string) {
+    const explanation = await this.prisma.explanation.findUnique({
+      where: { shareId },
+      select: {
+        id: true,
+        topic: true,
+        level: true,
+        answer: true,
+        createdAt: true,
+        comments: {
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            authorName: true,
+            content: true,
+            createdAt: true,
+          },
+        },
+      },
+    });
+
+    if (!explanation) {
+      throw new NotFoundException('Shared explanation not found');
+    }
+
+    return explanation;
+  }
+
+  async addPublicComment(shareId: string, dto: CreatePublicCommentDto) {
+    const explanation = await this.prisma.explanation.findUnique({
+      where: { shareId },
+      select: { id: true },
+    });
+
+    if (!explanation) {
+      throw new NotFoundException('Shared explanation not found');
+    }
+
+    const authorName = dto.authorName?.trim() || 'Anonymous';
+    const content = dto.content.trim();
+
+    return this.prisma.publicComment.create({
+      data: {
+        authorName,
+        content,
+        explanationId: explanation.id,
+      },
+      select: {
+        id: true,
+        authorName: true,
+        content: true,
         createdAt: true,
       },
     });
@@ -136,5 +227,21 @@ export class ExplainService {
     }
 
     throw new BadGatewayException('LLM API returned an empty answer payload');
+  }
+
+  private async generateUniqueShareId() {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const shareId = randomBytes(9).toString('base64url');
+      const existing = await this.prisma.explanation.findUnique({
+        where: { shareId },
+        select: { id: true },
+      });
+
+      if (!existing) {
+        return shareId;
+      }
+    }
+
+    throw new BadGatewayException('Failed to generate a unique share link');
   }
 }
