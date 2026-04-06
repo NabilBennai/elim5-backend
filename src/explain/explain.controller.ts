@@ -9,10 +9,7 @@ export class ExplainController {
   constructor(private explain: ExplainService) {}
 
   @Post()
-  create(
-    @Body() dto: CreateExplanationDto,
-    @Request() req: { user: { id: string } },
-  ) {
+  create(@Body() dto: CreateExplanationDto, @Request() req: { user: { id: string } }) {
     return this.explain.create(dto, req.user.id);
   }
 

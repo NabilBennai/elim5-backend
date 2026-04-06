@@ -1,22 +1,58 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateExplanationDto } from './explain.dto';
 
-const MOCK_ANSWERS = [
-  "Imagine you have a big box of LEGOs. {topic} is like building something cool with those LEGOs — you take small, simple pieces and put them together step by step until you have something amazing. Each piece on its own isn't much, but together they make something great!",
-  "You know how when you mix red and blue paint you get purple? {topic} works kind of like that — you take a couple of simple things, mix them together in the right way, and you get something completely new and different!",
-  "Think of {topic} like a recipe for your favorite cookies. You need specific ingredients, you follow the steps in order, and at the end you get something delicious. If you skip a step or use the wrong ingredient, it won't turn out right!",
-  "Imagine you're playing telephone with your friends. {topic} is like making sure the message gets from the first person to the last person without getting all mixed up. There are special rules to help keep the message clear!",
-  "You know how a tree starts as a tiny seed? {topic} is like that — it starts really small and simple, but over time it grows bigger and more complex. And just like a tree needs water and sun, it needs the right conditions to work!",
-];
+const SYSTEM_PROMPT = `You are an expert at explaining complex topics in simple terms.
+When a user gives you a topic or concept, explain it as if they were 5 years old.
+Use simple analogies, everyday examples, and short sentences.
+Keep your explanation friendly, fun, and easy to understand.
+Do not use jargon or technical terms without immediately explaining them.
+Keep responses concise — aim for 3-5 short paragraphs at most.
+IMPORTANT: Always respond in the same language the user wrote their question in.`;
+
+interface ChatCompletionResponse {
+  choices: { message: { role: string; content: string } }[];
+}
 
 @Injectable()
 export class ExplainService {
-  constructor(private prisma: PrismaService) {}
+  private apiUrl: string;
+  private apiKey: string;
+  private model: string;
+
+  constructor(
+    private prisma: PrismaService,
+    config: ConfigService,
+  ) {
+    this.apiUrl = 'https://api.llmapi.ai/v1/chat/completions';
+    this.apiKey = config.getOrThrow<string>('LLMAPI_KEY');
+    this.model = config.get<string>('LLMAPI_MODEL', 'qwen-flash');
+  }
 
   async create(dto: CreateExplanationDto, userId: string) {
-    const mock = MOCK_ANSWERS[Math.floor(Math.random() * MOCK_ANSWERS.length)];
-    const answer = mock.replace(/\{topic\}/g, dto.topic);
+    const response = await fetch(this.apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.model,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: `Explain this like I'm 5: ${dto.topic}` },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`LLM API request failed (${response.status}): ${body}`);
+    }
+
+    const data = (await response.json()) as ChatCompletionResponse;
+    const answer = data.choices[0].message.content;
 
     return this.prisma.explanation.create({
       data: {
