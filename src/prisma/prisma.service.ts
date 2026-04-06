@@ -5,17 +5,25 @@ import { PrismaPg } from '@prisma/adapter-pg';
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
   constructor() {
-    const connectionString = process.env.DATABASE_URL;
+    const rawConnectionString = process.env.DATABASE_URL;
 
-    if (!connectionString) {
+    if (!rawConnectionString) {
       throw new Error('DATABASE_URL is not defined');
     }
 
     const acceptSelfSignedCert = process.env.DB_SSL_REJECT_UNAUTHORIZED === 'false';
-    const adapter = new PrismaPg({
-      connectionString,
-      ssl: acceptSelfSignedCert ? { rejectUnauthorized: false } : undefined,
-    });
+    const connectionUrl = new URL(rawConnectionString);
+
+    if (acceptSelfSignedCert) {
+      // Enables libpq-compatible semantics where sslmode=require does not enforce CA chain validation.
+      connectionUrl.searchParams.set('uselibpqcompat', 'true');
+      connectionUrl.searchParams.set('sslmode', 'require');
+    } else {
+      // Explicitly enforce certificate validation and silence pg's upcoming sslmode warning.
+      connectionUrl.searchParams.set('sslmode', 'verify-full');
+    }
+
+    const adapter = new PrismaPg(connectionUrl.toString());
 
     super({ adapter });
   }
