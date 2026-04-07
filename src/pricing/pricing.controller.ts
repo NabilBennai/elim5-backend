@@ -1,45 +1,50 @@
-import { Body, Controller, Get, HttpException, HttpStatus, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Post, Req, UseGuards } from '@nestjs/common';
+import { IsIn } from 'class-validator';
+import { Request } from 'express';
 import { PricingService } from './pricing.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
-interface CheckoutRequestDto {
+interface AuthenticatedRequest extends Request {
+  user: {
+    id: string;
+    email: string;
+  };
+  rawBody?: Buffer;
+}
+
+class CheckoutRequestDto {
+  @IsIn(['starter', 'pro'])
   planId: 'starter' | 'pro';
+
+  @IsIn(['monthly', 'yearly'])
   billingCycle: 'monthly' | 'yearly';
 }
 
-@Controller('pricing')
+@Controller()
 export class PricingController {
   constructor(private pricingService: PricingService) {}
 
-  @Get('plans')
+  @Get('pricing/plans')
   getPlans(): unknown {
     return this.pricingService.getPlans();
   }
 
   @UseGuards(JwtAuthGuard)
-  @Post('checkout')
-  createCheckout(@Body() body: CheckoutRequestDto): never {
-    if (!['starter', 'pro'].includes(body.planId)) {
-      throw new HttpException(
-        { message: 'Invalid planId', code: 'INVALID_PLAN' },
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+  @Post('pricing/checkout')
+  createCheckout(@Body() body: CheckoutRequestDto, @Req() req: AuthenticatedRequest) {
+    return this.pricingService.createCheckoutSession({
+      userId: req.user.id,
+      userEmail: req.user.email,
+      planId: body.planId,
+      billingCycle: body.billingCycle,
+    });
+  }
 
-    if (!['monthly', 'yearly'].includes(body.billingCycle)) {
-      throw new HttpException(
-        { message: 'Invalid billingCycle', code: 'INVALID_BILLING_CYCLE' },
-        HttpStatus.BAD_REQUEST,
-      );
-    }
-
-    throw new HttpException(
-      {
-        message:
-          'Payments are not enabled yet. Stripe checkout will be available in a future release.',
-        code: 'PAYMENTS_NOT_ENABLED',
-      },
-      HttpStatus.NOT_IMPLEMENTED,
-    );
+  @Post('stripe/webhook')
+  handleStripeWebhook(
+    @Req() req: AuthenticatedRequest,
+    @Headers('stripe-signature') stripeSignature: string | undefined,
+  ) {
+    return this.pricingService.handleWebhook(req.rawBody, stripeSignature);
   }
 }

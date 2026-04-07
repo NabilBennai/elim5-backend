@@ -1,5 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import StripeConstructor = require('stripe');
 
 interface PlanLimits {
   fiveHours: number;
@@ -19,9 +20,22 @@ interface PricingPlan {
   recommended: boolean;
 }
 
+interface CheckoutPayload {
+  userId: string;
+  userEmail: string;
+  planId: 'starter' | 'pro';
+  billingCycle: 'monthly' | 'yearly';
+}
+
 @Injectable()
 export class PricingService {
-  constructor(private config: ConfigService) {}
+  private readonly logger = new Logger(PricingService.name);
+  private readonly stripe: StripeConstructor.Stripe | null;
+
+  constructor(private config: ConfigService) {
+    const stripeSecretKey = this.config.get<string>('STRIPE_SECRET_KEY');
+    this.stripe = stripeSecretKey ? StripeConstructor(stripeSecretKey) : null;
+  }
 
   getPlans() {
     const free: PricingPlan = {
@@ -88,9 +102,122 @@ export class PricingService {
     };
 
     return {
-      paymentEnabled: false,
+      paymentEnabled: this.arePaymentsEnabled(),
       plans: [free, starter, pro],
     };
+  }
+
+  async createCheckoutSession(payload: CheckoutPayload) {
+    if (!this.arePaymentsEnabled() || !this.stripe) {
+      throw new HttpException(
+        {
+          message:
+            'Payments are not configured yet. Set Stripe keys and prices on the backend deployment.',
+          code: 'PAYMENTS_NOT_CONFIGURED',
+        },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    const priceId = this.getStripePriceId(payload.planId, payload.billingCycle);
+    const frontendUrl = this.config.get<string>('FRONTEND_URL')?.trim();
+    if (!frontendUrl) {
+      throw new HttpException(
+        {
+          message: 'Missing FRONTEND_URL in backend environment variables.',
+          code: 'MISSING_FRONTEND_URL',
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+
+    const successUrl = `${frontendUrl.replace(/\/$/, '')}/pricing?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${frontendUrl.replace(/\/$/, '')}/pricing?checkout=cancel`;
+
+    const session = await this.stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: payload.userEmail,
+      client_reference_id: payload.userId,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        userId: payload.userId,
+        userEmail: payload.userEmail,
+        planId: payload.planId,
+        billingCycle: payload.billingCycle,
+      },
+    });
+
+    if (!session.url) {
+      throw new HttpException(
+        {
+          message: 'Stripe did not return a checkout URL.',
+          code: 'MISSING_CHECKOUT_URL',
+        },
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    return { url: session.url };
+  }
+
+  handleWebhook(rawBody: Buffer | undefined, stripeSignature: string | undefined) {
+    const webhookSecret = this.config.get<string>('STRIPE_WEBHOOK_SECRET')?.trim();
+    if (!this.stripe || !webhookSecret) {
+      throw new HttpException(
+        { message: 'Webhook is not configured.', code: 'WEBHOOK_NOT_CONFIGURED' },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    if (!rawBody) {
+      throw new HttpException(
+        { message: 'Missing raw request body.', code: 'MISSING_RAW_BODY' },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    if (!stripeSignature) {
+      throw new HttpException(
+        { message: 'Missing Stripe signature header.', code: 'MISSING_SIGNATURE' },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    let event: any;
+    try {
+      event = this.stripe.webhooks.constructEvent(rawBody, stripeSignature, webhookSecret);
+    } catch {
+      throw new HttpException(
+        { message: 'Invalid webhook signature.', code: 'INVALID_SIGNATURE' },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object as {
+          id: string;
+          metadata?: Record<string, string>;
+        };
+        this.logger.log(
+          `Checkout completed: session=${session.id} user=${session.metadata?.userId ?? 'unknown'} plan=${session.metadata?.planId ?? 'unknown'}`,
+        );
+        break;
+      }
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted':
+      case 'invoice.paid':
+      case 'invoice.payment_failed':
+        this.logger.log(`Stripe event received: ${event.type}`);
+        break;
+      default:
+        this.logger.debug(`Unhandled Stripe event: ${event.type}`);
+        break;
+    }
+
+    return { received: true };
   }
 
   private readPositiveInt(key: string, defaultValue: number) {
@@ -105,5 +232,34 @@ export class PricingService {
     }
 
     return Math.floor(parsed);
+  }
+
+  private arePaymentsEnabled() {
+    return Boolean(
+      this.config.get<string>('STRIPE_SECRET_KEY') &&
+      this.config.get<string>('STRIPE_PRICE_STARTER_MONTHLY') &&
+      this.config.get<string>('STRIPE_PRICE_STARTER_YEARLY') &&
+      this.config.get<string>('STRIPE_PRICE_PRO_MONTHLY') &&
+      this.config.get<string>('STRIPE_PRICE_PRO_YEARLY'),
+    );
+  }
+
+  private getStripePriceId(
+    planId: CheckoutPayload['planId'],
+    billingCycle: CheckoutPayload['billingCycle'],
+  ) {
+    const key = `STRIPE_PRICE_${planId.toUpperCase()}_${billingCycle.toUpperCase()}`;
+    const priceId = this.config.get<string>(key)?.trim();
+    if (!priceId) {
+      throw new HttpException(
+        {
+          message: `Missing Stripe price id for ${planId}/${billingCycle}.`,
+          code: 'MISSING_PRICE_ID',
+          env: key,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+    return priceId;
   }
 }
