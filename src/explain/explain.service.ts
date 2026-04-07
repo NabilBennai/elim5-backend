@@ -72,6 +72,7 @@ export class ExplainService {
   private apiUrl: string;
   private apiKey: string;
   private model: string;
+  private fallbackModel: string | null;
   private freeLimits: { fiveHours: number; daily: number; weekly: number };
   private starterLimits: { fiveHours: number; daily: number; weekly: number };
   private proLimits: { fiveHours: number; daily: number; weekly: number };
@@ -83,6 +84,7 @@ export class ExplainService {
     this.apiUrl = 'https://api.llmapi.ai/v1/chat/completions';
     this.apiKey = config.getOrThrow<string>('LLMAPI_KEY');
     this.model = config.get<string>('LLMAPI_MODEL', 'qwen-flash');
+    this.fallbackModel = config.get<string>('LLMAPI_FALLBACK_MODEL', '').trim() || null;
     this.freeLimits = {
       fiveHours: this.readPositiveInt(config, 'AI_CREDITS_5H', 10),
       daily: this.readPositiveInt(config, 'AI_CREDITS_DAILY', 25),
@@ -111,30 +113,29 @@ export class ExplainService {
           .join('\n')}`
       : '';
 
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: `Level: ${dto.level}\nInstruction: ${levelInstruction}\nTopic: ${dto.topic}${sourcePrompt}`,
       },
-      body: JSON.stringify({
-        model: this.model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          {
-            role: 'user',
-            content: `Level: ${dto.level}\nInstruction: ${levelInstruction}\nTopic: ${dto.topic}${sourcePrompt}`,
-          },
-        ],
-      }),
-    });
+    ];
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`LLM API request failed (${response.status}): ${body}`);
+    let data: ChatCompletionResponse;
+    try {
+      data = await this.requestCompletion(this.model, messages);
+    } catch (err) {
+      if (
+        this.fallbackModel &&
+        this.fallbackModel !== this.model &&
+        this.isInvalidModelError(err)
+      ) {
+        data = await this.requestCompletion(this.fallbackModel, messages);
+      } else {
+        throw err;
+      }
     }
 
-    const data = (await response.json()) as ChatCompletionResponse;
     const answer = this.extractAnswer(data);
 
     return this.prisma.explanation.create({
@@ -437,6 +438,64 @@ export class ExplainService {
     }
 
     return Math.floor(parsed);
+  }
+
+  private async requestCompletion(
+    model: string,
+    messages: Array<{ role: string; content: string }>,
+  ): Promise<ChatCompletionResponse> {
+    const response = await fetch(this.apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+      }),
+    });
+
+    if (!response.ok) {
+      const bodyText = await response.text();
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(bodyText);
+      } catch {
+        parsed = null;
+      }
+
+      const providerMessage =
+        typeof parsed === 'object' && parsed && 'error' in parsed
+          ? (parsed as { error?: { message?: string } }).error?.message
+          : undefined;
+
+      throw new HttpException(
+        {
+          message:
+            providerMessage ||
+            `LLM API request failed (${response.status}). Check LLMAPI_MODEL configuration.`,
+          code: 'LLM_PROVIDER_ERROR',
+          model,
+          status: response.status,
+          provider: parsed,
+        },
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    return (await response.json()) as ChatCompletionResponse;
+  }
+
+  private isInvalidModelError(err: unknown) {
+    if (!(err instanceof HttpException)) return false;
+    const payload = err.getResponse() as
+      | string
+      | { message?: string; provider?: { error?: { code?: string; message?: string } } };
+    if (typeof payload === 'string') return false;
+    const code = payload.provider?.error?.code?.toLowerCase();
+    const message = payload.provider?.error?.message?.toLowerCase();
+    return code === 'provider_error' && Boolean(message?.includes('invalid model'));
   }
 
   private async generateUniqueShareId() {
