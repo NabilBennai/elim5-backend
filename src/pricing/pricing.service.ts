@@ -26,8 +26,8 @@ export class PricingService {
   getPlans() {
     const free: PricingPlan = {
       id: 'free',
-      name: 'Free',
-      tagline: 'Best for trying ELI5',
+      name: 'pricing.plan.free.name',
+      tagline: 'pricing.plan.free.tagline',
       priceMonthly: 0,
       priceYearlyMonthly: 0,
       currency: 'EUR',
@@ -37,18 +37,18 @@ export class PricingService {
         weekly: this.readPositiveInt('AI_CREDITS_WEEKLY', 120),
       },
       features: [
-        'All explanation levels',
-        'Source-grounded explanations',
-        'Public share pages',
-        'Community support',
+        'pricing.plan.free.features.allLevels',
+        'pricing.plan.free.features.sourceGrounded',
+        'pricing.plan.free.features.publicShare',
+        'pricing.plan.free.features.community',
       ],
       recommended: false,
     };
 
     const starter: PricingPlan = {
       id: 'starter',
-      name: 'Starter',
-      tagline: 'For regular learners and students',
+      name: 'pricing.plan.starter.name',
+      tagline: 'pricing.plan.starter.tagline',
       priceMonthly: this.readPositiveInt('PRICE_STARTER_MONTHLY_EUR', 9),
       priceYearlyMonthly: this.readPositiveInt('PRICE_STARTER_YEARLY_MONTHLY_EUR', 7),
       currency: 'EUR',
@@ -58,18 +58,18 @@ export class PricingService {
         weekly: this.readPositiveInt('AI_CREDITS_WEEKLY_STARTER', 800),
       },
       features: [
-        'Higher credit caps',
-        'Faster generation queue',
-        'Save favorite explanations',
-        'Early feature access',
+        'pricing.plan.starter.features.higherCaps',
+        'pricing.plan.starter.features.fasterQueue',
+        'pricing.plan.starter.features.favorites',
+        'pricing.plan.starter.features.earlyAccess',
       ],
       recommended: true,
     };
 
     const pro: PricingPlan = {
       id: 'pro',
-      name: 'Pro',
-      tagline: 'For power users and teams',
+      name: 'pricing.plan.pro.name',
+      tagline: 'pricing.plan.pro.tagline',
       priceMonthly: this.readPositiveInt('PRICE_PRO_MONTHLY_EUR', 29),
       priceYearlyMonthly: this.readPositiveInt('PRICE_PRO_YEARLY_MONTHLY_EUR', 24),
       currency: 'EUR',
@@ -79,10 +79,10 @@ export class PricingService {
         weekly: this.readPositiveInt('AI_CREDITS_WEEKLY_PRO', 2500),
       },
       features: [
-        'Maximum credit caps',
-        'Fastest generation priority',
-        'Team workspace (coming soon)',
-        'Advanced usage analytics',
+        'pricing.plan.pro.features.maxCaps',
+        'pricing.plan.pro.features.fastestPriority',
+        'pricing.plan.pro.features.teamWorkspace',
+        'pricing.plan.pro.features.analytics',
       ],
       recommended: false,
     };
