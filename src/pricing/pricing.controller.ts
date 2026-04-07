@@ -46,6 +46,12 @@ export class PricingController {
     });
   }
 
+  @UseGuards(JwtAuthGuard)
+  @Post('pricing/portal')
+  createPortal(@Req() req: AuthenticatedRequest): Promise<{ url: string }> {
+    return this.pricingService.createPortalSession(req.user.id);
+  }
+
   @Post('stripe/webhook')
   handleStripeWebhook(
     @Req() req: AuthenticatedRequest,

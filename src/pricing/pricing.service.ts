@@ -28,6 +28,10 @@ interface CheckoutPayload {
   billingCycle: 'monthly' | 'yearly';
 }
 
+interface PortalSessionResponse {
+  url: string;
+}
+
 @Injectable()
 export class PricingService {
   private readonly logger = new Logger(PricingService.name);
@@ -176,6 +180,58 @@ export class PricingService {
         {
           message: 'Stripe did not return a checkout URL.',
           code: 'MISSING_CHECKOUT_URL',
+        },
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+
+    return { url: session.url };
+  }
+
+  async createPortalSession(userId: string): Promise<PortalSessionResponse> {
+    if (!this.stripe || !this.config.get<string>('STRIPE_SECRET_KEY')) {
+      throw new HttpException(
+        {
+          message: 'Payments are not configured yet on the backend.',
+          code: 'PAYMENTS_NOT_CONFIGURED',
+        },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { stripeCustomerId: true },
+    });
+
+    const fallbackSubscription = await this.prisma.billingSubscription.findFirst({
+      where: { userId },
+      orderBy: { updatedAt: 'desc' },
+      select: { stripeCustomerId: true },
+    });
+
+    const customerId = user?.stripeCustomerId || fallbackSubscription?.stripeCustomerId;
+    if (!customerId) {
+      throw new HttpException(
+        {
+          message: 'No Stripe customer found for this account.',
+          code: 'NO_STRIPE_CUSTOMER',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const frontendUrl = this.getFrontendUrl();
+    const session = await this.stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${frontendUrl}/profile`,
+    });
+
+    if (!session.url) {
+      throw new HttpException(
+        {
+          message: 'Stripe did not return a customer portal URL.',
+          code: 'MISSING_PORTAL_URL',
         },
         HttpStatus.BAD_GATEWAY,
       );
