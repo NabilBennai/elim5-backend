@@ -7,11 +7,13 @@ datasource db {
 }
 
 model User {
-  id             String        @id @default(uuid())
-  email          String        @unique
-  password       String
-  createdAt      DateTime      @default(now())
-  explanations   Explanation[]
+  id                   String                @id @default(uuid())
+  email                String                @unique
+  password             String
+  stripeCustomerId     String?               @unique
+  createdAt            DateTime              @default(now())
+  explanations         Explanation[]
+  billingSubscriptions BillingSubscription[]
 }
 
 model Explanation {
@@ -45,4 +47,24 @@ model PublicComment {
   explanationId String
   explanation   Explanation @relation(fields: [explanationId], references: [id], onDelete: Cascade)
   createdAt     DateTime    @default(now())
+}
+
+model BillingSubscription {
+  id                   String   @id @default(uuid())
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stripeSubscriptionId String   @unique
+  stripeCustomerId     String
+  planId               String
+  billingCycle         String
+  status               String
+  cancelAtPeriodEnd    Boolean  @default(false)
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  lastInvoiceStatus    String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([userId])
+  @@index([stripeCustomerId])
 }

@@ -30,6 +30,12 @@ export class PricingController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Get('pricing/subscription')
+  getCurrentSubscription(@Req() req: AuthenticatedRequest) {
+    return this.pricingService.getCurrentSubscription(req.user.id);
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Post('pricing/checkout')
   createCheckout(@Body() body: CheckoutRequestDto, @Req() req: AuthenticatedRequest) {
     return this.pricingService.createCheckoutSession({

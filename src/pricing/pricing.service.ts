@@ -1,6 +1,7 @@
 import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import StripeConstructor = require('stripe');
+import { PrismaService } from '../prisma/prisma.service';
 
 interface PlanLimits {
   fiveHours: number;
@@ -32,7 +33,10 @@ export class PricingService {
   private readonly logger = new Logger(PricingService.name);
   private readonly stripe: StripeConstructor.Stripe | null;
 
-  constructor(private config: ConfigService) {
+  constructor(
+    private config: ConfigService,
+    private prisma: PrismaService,
+  ) {
     const stripeSecretKey = this.config.get<string>('STRIPE_SECRET_KEY');
     this.stripe = stripeSecretKey ? StripeConstructor(stripeSecretKey) : null;
   }
@@ -107,6 +111,33 @@ export class PricingService {
     };
   }
 
+  async getCurrentSubscription(userId: string) {
+    const current = await this.prisma.billingSubscription.findFirst({
+      where: { userId },
+      orderBy: { updatedAt: 'desc' },
+    });
+
+    if (!current) {
+      return {
+        isActive: false,
+        planId: 'free',
+        billingCycle: 'monthly',
+        status: 'inactive',
+        cancelAtPeriodEnd: false,
+        currentPeriodEnd: null,
+      };
+    }
+
+    return {
+      isActive: ['active', 'trialing', 'past_due'].includes(current.status),
+      planId: current.planId,
+      billingCycle: current.billingCycle,
+      status: current.status,
+      cancelAtPeriodEnd: current.cancelAtPeriodEnd,
+      currentPeriodEnd: current.currentPeriodEnd,
+    };
+  }
+
   async createCheckoutSession(payload: CheckoutPayload) {
     if (!this.arePaymentsEnabled() || !this.stripe) {
       throw new HttpException(
@@ -120,19 +151,10 @@ export class PricingService {
     }
 
     const priceId = this.getStripePriceId(payload.planId, payload.billingCycle);
-    const frontendUrl = this.config.get<string>('FRONTEND_URL')?.trim();
-    if (!frontendUrl) {
-      throw new HttpException(
-        {
-          message: 'Missing FRONTEND_URL in backend environment variables.',
-          code: 'MISSING_FRONTEND_URL',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
+    const frontendUrl = this.getFrontendUrl();
 
-    const successUrl = `${frontendUrl.replace(/\/$/, '')}/pricing?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${frontendUrl.replace(/\/$/, '')}/pricing?checkout=cancel`;
+    const successUrl = `${frontendUrl}/pricing?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${frontendUrl}/pricing?checkout=cancel`;
 
     const session = await this.stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -162,7 +184,7 @@ export class PricingService {
     return { url: session.url };
   }
 
-  handleWebhook(rawBody: Buffer | undefined, stripeSignature: string | undefined) {
+  async handleWebhook(rawBody: Buffer | undefined, stripeSignature: string | undefined) {
     const webhookSecret = this.config.get<string>('STRIPE_WEBHOOK_SECRET')?.trim();
     if (!this.stripe || !webhookSecret) {
       throw new HttpException(
@@ -197,27 +219,192 @@ export class PricingService {
 
     switch (event.type) {
       case 'checkout.session.completed': {
-        const session = event.data.object as {
-          id: string;
-          metadata?: Record<string, string>;
-        };
-        this.logger.log(
-          `Checkout completed: session=${session.id} user=${session.metadata?.userId ?? 'unknown'} plan=${session.metadata?.planId ?? 'unknown'}`,
-        );
+        await this.handleCheckoutCompleted(event.data.object as any);
         break;
       }
       case 'customer.subscription.updated':
-      case 'customer.subscription.deleted':
-      case 'invoice.paid':
-      case 'invoice.payment_failed':
-        this.logger.log(`Stripe event received: ${event.type}`);
+      case 'customer.subscription.deleted': {
+        await this.handleSubscriptionChanged(event.data.object as any);
         break;
+      }
+      case 'invoice.paid':
+      case 'invoice.payment_failed': {
+        await this.handleInvoiceEvent(event.data.object as any);
+        break;
+      }
       default:
         this.logger.debug(`Unhandled Stripe event: ${event.type}`);
         break;
     }
 
     return { received: true };
+  }
+
+  private async handleCheckoutCompleted(session: any) {
+    const userId = session.client_reference_id || session.metadata?.userId;
+    const customerId = this.extractId(session.customer);
+    const subscriptionId = this.extractId(session.subscription);
+
+    if (userId && customerId) {
+      await this.prisma.user.updateMany({
+        where: { id: userId },
+        data: { stripeCustomerId: customerId },
+      });
+    }
+
+    if (!subscriptionId) {
+      this.logger.warn(`checkout.session.completed without subscription id: session=${session.id}`);
+      return;
+    }
+
+    await this.syncSubscriptionFromStripe(subscriptionId, userId || undefined);
+  }
+
+  private async handleSubscriptionChanged(subscription: any) {
+    const subscriptionId = this.extractId(subscription.id);
+    if (!subscriptionId) {
+      this.logger.warn('customer.subscription.* received without subscription id');
+      return;
+    }
+
+    await this.syncSubscriptionFromStripe(subscriptionId);
+  }
+
+  private async handleInvoiceEvent(invoice: any) {
+    const subscriptionId = this.extractId(invoice.subscription);
+    if (!subscriptionId) {
+      this.logger.warn(`invoice event without subscription id: invoice=${invoice.id}`);
+      return;
+    }
+
+    await this.prisma.billingSubscription.updateMany({
+      where: { stripeSubscriptionId: subscriptionId },
+      data: {
+        lastInvoiceStatus: String(invoice.status || ''),
+      },
+    });
+  }
+
+  private async syncSubscriptionFromStripe(subscriptionId: string, userIdHint?: string) {
+    if (!this.stripe) return;
+
+    const subscription = (await this.stripe.subscriptions.retrieve(subscriptionId)) as any;
+    const customerId = this.extractId(subscription.customer);
+
+    let userId = userIdHint;
+
+    if (!userId && customerId) {
+      const userByCustomer = await this.prisma.user.findUnique({
+        where: { stripeCustomerId: customerId },
+        select: { id: true },
+      });
+      userId = userByCustomer?.id;
+    }
+
+    if (!userId) {
+      const existing = await this.prisma.billingSubscription.findUnique({
+        where: { stripeSubscriptionId: subscriptionId },
+        select: { userId: true },
+      });
+      userId = existing?.userId;
+    }
+
+    if (!userId) {
+      this.logger.warn(
+        `Unable to map Stripe subscription to user: subscription=${subscriptionId} customer=${customerId || 'unknown'}`,
+      );
+      return;
+    }
+
+    if (customerId) {
+      await this.prisma.user.updateMany({
+        where: { id: userId },
+        data: { stripeCustomerId: customerId },
+      });
+    }
+
+    const firstPriceId = this.extractId(subscription.items?.data?.[0]?.price?.id);
+    const planId = this.resolvePlanFromPriceId(firstPriceId);
+    const billingCycle = this.resolveBillingFromPriceId(firstPriceId);
+
+    await this.prisma.billingSubscription.upsert({
+      where: { stripeSubscriptionId: String(subscription.id) },
+      create: {
+        userId,
+        stripeSubscriptionId: String(subscription.id),
+        stripeCustomerId: customerId || '',
+        planId,
+        billingCycle,
+        status: String(subscription.status),
+        cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+        currentPeriodStart: this.fromUnix(subscription.current_period_start),
+        currentPeriodEnd: this.fromUnix(subscription.current_period_end),
+        lastInvoiceStatus: null,
+      },
+      update: {
+        stripeCustomerId: customerId || '',
+        planId,
+        billingCycle,
+        status: String(subscription.status),
+        cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+        currentPeriodStart: this.fromUnix(subscription.current_period_start),
+        currentPeriodEnd: this.fromUnix(subscription.current_period_end),
+      },
+    });
+  }
+
+  private extractId(value: unknown): string | null {
+    if (!value) return null;
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object' && value !== null && 'id' in value) {
+      const id = (value as { id?: unknown }).id;
+      return typeof id === 'string' ? id : null;
+    }
+    return null;
+  }
+
+  private fromUnix(value: unknown): Date | null {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+    return new Date(value * 1000);
+  }
+
+  private resolvePlanFromPriceId(priceId: string | null) {
+    if (!priceId) return 'free';
+    const map = this.getPriceIdMap();
+    if (priceId === map.starterMonthly || priceId === map.starterYearly) return 'starter';
+    if (priceId === map.proMonthly || priceId === map.proYearly) return 'pro';
+    return 'free';
+  }
+
+  private resolveBillingFromPriceId(priceId: string | null): 'monthly' | 'yearly' {
+    if (!priceId) return 'monthly';
+    const map = this.getPriceIdMap();
+    if (priceId === map.starterYearly || priceId === map.proYearly) return 'yearly';
+    return 'monthly';
+  }
+
+  private getPriceIdMap() {
+    return {
+      starterMonthly: this.config.get<string>('STRIPE_PRICE_STARTER_MONTHLY')?.trim() || '',
+      starterYearly: this.config.get<string>('STRIPE_PRICE_STARTER_YEARLY')?.trim() || '',
+      proMonthly: this.config.get<string>('STRIPE_PRICE_PRO_MONTHLY')?.trim() || '',
+      proYearly: this.config.get<string>('STRIPE_PRICE_PRO_YEARLY')?.trim() || '',
+    };
+  }
+
+  private getFrontendUrl() {
+    const raw = this.config.get<string>('FRONTEND_URL')?.trim();
+    if (!raw) {
+      throw new HttpException(
+        {
+          message: 'Missing FRONTEND_URL in backend environment variables.',
+          code: 'MISSING_FRONTEND_URL',
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+
+    return raw.replace(/\.+$/, '').replace(/\/$/, '');
   }
 
   private readPositiveInt(key: string, defaultValue: number) {
