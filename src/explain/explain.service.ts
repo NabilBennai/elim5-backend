@@ -63,6 +63,7 @@ interface CreditWindowStatus {
 
 interface CreditStatusResponse {
   allowed: boolean;
+  planId: 'free' | 'starter' | 'pro';
   windows: CreditWindowStatus[];
 }
 
@@ -71,9 +72,9 @@ export class ExplainService {
   private apiUrl: string;
   private apiKey: string;
   private model: string;
-  private credits5hLimit: number;
-  private creditsDailyLimit: number;
-  private creditsWeeklyLimit: number;
+  private freeLimits: { fiveHours: number; daily: number; weekly: number };
+  private starterLimits: { fiveHours: number; daily: number; weekly: number };
+  private proLimits: { fiveHours: number; daily: number; weekly: number };
 
   constructor(
     private prisma: PrismaService,
@@ -82,9 +83,21 @@ export class ExplainService {
     this.apiUrl = 'https://api.llmapi.ai/v1/chat/completions';
     this.apiKey = config.getOrThrow<string>('LLMAPI_KEY');
     this.model = config.get<string>('LLMAPI_MODEL', 'qwen-flash');
-    this.credits5hLimit = this.readPositiveInt(config, 'AI_CREDITS_5H', 10);
-    this.creditsDailyLimit = this.readPositiveInt(config, 'AI_CREDITS_DAILY', 25);
-    this.creditsWeeklyLimit = this.readPositiveInt(config, 'AI_CREDITS_WEEKLY', 120);
+    this.freeLimits = {
+      fiveHours: this.readPositiveInt(config, 'AI_CREDITS_5H', 10),
+      daily: this.readPositiveInt(config, 'AI_CREDITS_DAILY', 25),
+      weekly: this.readPositiveInt(config, 'AI_CREDITS_WEEKLY', 120),
+    };
+    this.starterLimits = {
+      fiveHours: this.readPositiveInt(config, 'AI_CREDITS_5H_STARTER', 45),
+      daily: this.readPositiveInt(config, 'AI_CREDITS_DAILY_STARTER', 180),
+      weekly: this.readPositiveInt(config, 'AI_CREDITS_WEEKLY_STARTER', 800),
+    };
+    this.proLimits = {
+      fiveHours: this.readPositiveInt(config, 'AI_CREDITS_5H_PRO', 140),
+      daily: this.readPositiveInt(config, 'AI_CREDITS_DAILY_PRO', 600),
+      weekly: this.readPositiveInt(config, 'AI_CREDITS_WEEKLY_PRO', 2500),
+    };
   }
 
   async create(dto: CreateExplanationDto, userId: string) {
@@ -189,7 +202,9 @@ export class ExplainService {
 
   async getCredits(userId: string): Promise<CreditStatusResponse> {
     const now = new Date();
-    const windows = this.getWindows(now);
+    const planId = await this.getEffectivePlan(userId);
+    const limits = this.getLimitsForPlan(planId);
+    const windows = this.getWindows(now, limits);
 
     const usage = await Promise.all(
       windows.map((window) =>
@@ -218,7 +233,7 @@ export class ExplainService {
     });
 
     const allowed = statuses.every((status) => status.remaining > 0);
-    return { allowed, windows: statuses };
+    return { allowed, planId, windows: statuses };
   }
 
   async createShare(explanationId: string, userId: string) {
@@ -355,30 +370,59 @@ export class ExplainService {
     );
   }
 
-  private getWindows(now: Date) {
+  private getWindows(now: Date, limits: { fiveHours: number; daily: number; weekly: number }) {
     return [
       {
         key: 'fiveHours' as const,
         label: '5h',
         hours: 5,
-        limit: this.credits5hLimit,
+        limit: limits.fiveHours,
         since: new Date(now.getTime() - 5 * 60 * 60 * 1000),
       },
       {
         key: 'daily' as const,
         label: '24h',
         hours: 24,
-        limit: this.creditsDailyLimit,
+        limit: limits.daily,
         since: new Date(now.getTime() - 24 * 60 * 60 * 1000),
       },
       {
         key: 'weekly' as const,
         label: '7d',
         hours: 7 * 24,
-        limit: this.creditsWeeklyLimit,
+        limit: limits.weekly,
         since: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000),
       },
     ];
+  }
+
+  private async getEffectivePlan(userId: string): Promise<'free' | 'starter' | 'pro'> {
+    const activeSubscription = await this.prisma.billingSubscription.findFirst({
+      where: {
+        userId,
+        status: { in: ['active', 'trialing', 'past_due'] },
+      },
+      orderBy: { updatedAt: 'desc' },
+      select: { planId: true },
+    });
+
+    if (activeSubscription?.planId === 'starter' || activeSubscription?.planId === 'pro') {
+      return activeSubscription.planId;
+    }
+
+    return 'free';
+  }
+
+  private getLimitsForPlan(planId: 'free' | 'starter' | 'pro') {
+    if (planId === 'starter') {
+      return this.starterLimits;
+    }
+
+    if (planId === 'pro') {
+      return this.proLimits;
+    }
+
+    return this.freeLimits;
   }
 
   private readPositiveInt(config: ConfigService, key: string, defaultValue: number) {
